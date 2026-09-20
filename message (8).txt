@@ -1,0 +1,2804 @@
+-- RIVALS Cosmetics Core
+
+-- Silent / no custom GUI / no print / no warn / no notifications
+
+-- Built from the native-cosmetics approach used by KH/KiciaHook plus the
+
+-- working client hooks from the supplied script.
+task.wait(10)
+local Players = game:GetService("Players")
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+
+local playerScripts = player:WaitForChild("PlayerScripts")
+
+local controllers = playerScripts:WaitForChild("Controllers")
+
+local modules = ReplicatedStorage:WaitForChild("Modules")
+
+local EnumLibrary = require(modules:WaitForChild("EnumLibrary", 10))
+
+if EnumLibrary and type(EnumLibrary.WaitForEnumBuilder) == "function" then
+
+    EnumLibrary:WaitForEnumBuilder()
+
+end
+
+local CosmeticLibrary = require(modules:WaitForChild("CosmeticLibrary", 10))
+
+local ItemLibrary = require(modules:WaitForChild("ItemLibrary", 10))
+
+local DataController = require(controllers:WaitForChild("PlayerDataController", 10))
+
+local CONFIG_FOLDER = "rivals_cosmetics"
+
+local CONFIG_FILE = CONFIG_FOLDER .. "/config.json"
+
+local NONE = "None"
+
+local RANDOM = "Random"
+
+local SLOT_FRAME_SENTINEL = "Frame\0rahh"
+
+local WEAPON_TYPES = {
+
+    Skin = true,
+
+    Wrap = true,
+
+    Wrapping = true,
+
+    Charm = true,
+
+    Finisher = true,
+
+}
+
+local ALL_TYPES = {
+
+    Skin = true,
+
+    Wrap = true,
+
+    Wrapping = true,
+
+    Charm = true,
+
+    Finisher = true,
+
+    Emote = true,
+
+}
+
+local State = {
+
+    weapons = {},
+
+    emotes = {},
+
+    wrapInverted = {},
+
+}
+
+local SYNC_URL = "https://rivals-cosmetics-sync.gomesmarco2008.workers.dev"
+
+local SYNC_POLL_SECONDS = 5
+
+local SYNC_HEARTBEAT_SECONDS = 25
+
+-- false = your own wraps still work locally, but wraps are never shared
+-- through Cloudflare and spoofed wraps from other users are ignored.
+local SHARE_WRAPS = false
+
+local SharedCosmetics = {}
+
+local syncHttpRequest = nil
+
+local queueSyncPublish = nil
+
+local nativeSlotBound = false
+
+local equipmentStateHooked = false
+
+local playerDataAddedConnection = nil
+
+local emoteControllerHooked = false
+
+local finisherHooked = false
+
+local function safeRequire(instance)
+
+    if not instance then
+
+        return nil
+
+    end
+
+    local ok, value = pcall(require, instance)
+
+    if ok then
+
+        return value
+
+    end
+
+    return nil
+
+end
+
+local function normalizeName(value)
+
+    if type(value) == "string" then
+
+        return value
+
+    end
+
+    if type(value) == "table" and type(value.Name) == "string" then
+
+        return value.Name
+
+    end
+
+    if typeof(value) == "EnumItem" then
+
+        return value.Name
+
+    end
+
+    return nil
+
+end
+
+local function normalizeType(value)
+
+    local name = normalizeName(value)
+
+    if name == "Wrapping" then
+
+        return "Wrap"
+
+    end
+
+    return name
+
+end
+
+local function hasUnobtainableMarker(value)
+
+    local valueType = typeof(value)
+
+    if valueType == "string" or valueType == "EnumItem" then
+
+        return tostring(value):lower():find("unobtainable", 1, true) ~= nil
+
+    end
+
+    if type(value) == "table" then
+
+        for _, key in ipairs({"Name", "Value", "Type", "Rarity", "Status"}) do
+
+            local nested = rawget(value, key)
+
+            if nested ~= nil and nested ~= value and hasUnobtainableMarker(nested) then
+
+                return true
+
+            end
+
+        end
+
+    end
+
+    return false
+
+end
+
+local function isUnobtainable(cosmetic)
+
+    if type(cosmetic) ~= "table" then
+
+        return false
+
+    end
+
+    if cosmetic.Unobtainable == true then
+
+        return true
+
+    end
+
+    for _, key in ipairs({
+
+        "Rarity",
+
+        "RarityName",
+
+        "Availability",
+
+        "Obtainability",
+
+        "Status",
+
+        "Category",
+
+    }) do
+
+        if hasUnobtainableMarker(cosmetic[key]) then
+
+            return true
+
+        end
+
+    end
+
+    local tags = cosmetic.Tags
+
+    if type(tags) == "table" then
+
+        for key, value in pairs(tags) do
+
+            if hasUnobtainableMarker(key) or hasUnobtainableMarker(value) then
+
+                return true
+
+            end
+
+        end
+
+    end
+
+    return false
+
+end
+
+local AllowedCosmeticType = {}
+
+for cosmeticName, cosmetic in pairs(CosmeticLibrary.Cosmetics or {}) do
+
+    if type(cosmeticName) == "string"
+
+        and type(cosmetic) == "table"
+
+        and not isUnobtainable(cosmetic) then
+
+        local cosmeticType = normalizeType(cosmetic.Type)
+
+        if ALL_TYPES[cosmeticType] then
+
+            AllowedCosmeticType[cosmeticName] = cosmeticType
+
+        end
+
+    end
+
+end
+
+local function isSupportedCosmetic(name, expectedType)
+
+    if type(name) ~= "string" or name == "" then
+
+        return false
+
+    end
+
+    local cosmeticType = AllowedCosmeticType[name]
+
+    if not cosmeticType then
+
+        return false
+
+    end
+
+    if expectedType then
+
+        return cosmeticType == normalizeType(expectedType)
+
+    end
+
+    return true
+
+end
+
+local function ensureConfigFolder()
+
+    if type(makefolder) ~= "function" then
+
+        return
+
+    end
+
+    if type(isfolder) == "function" then
+
+        if not isfolder(CONFIG_FOLDER) then
+
+            pcall(makefolder, CONFIG_FOLDER)
+
+        end
+
+    else
+
+        pcall(makefolder, CONFIG_FOLDER)
+
+    end
+
+end
+
+local function saveConfig()
+
+    if type(writefile) ~= "function" then
+
+        return false
+
+    end
+
+    local serializable = {
+
+        version = 2,
+
+        weapons = {},
+
+        emotes = {},
+
+        wrapInverted = {},
+
+    }
+
+    for weaponName, selections in pairs(State.weapons) do
+
+        if type(weaponName) == "string" and type(selections) == "table" then
+
+            local clean = {}
+
+            for _, kind in ipairs({"Skin", "Wrap", "Charm", "Finisher"}) do
+
+                local value = selections[kind]
+
+                if type(value) == "string" and value ~= "" then
+
+                    if value == NONE or isSupportedCosmetic(value, kind) then
+
+                        clean[kind] = value
+
+                    end
+
+                end
+
+            end
+
+            if next(clean) ~= nil then
+
+                serializable.weapons[weaponName] = clean
+
+            end
+
+        end
+
+    end
+
+    for slotKey, emoteName in pairs(State.emotes) do
+
+        if type(emoteName) == "string" and isSupportedCosmetic(emoteName, "Emote") then
+
+            serializable.emotes[tostring(slotKey)] = emoteName
+
+        end
+
+    end
+
+    for weaponName, inverted in pairs(State.wrapInverted) do
+
+        if type(weaponName) == "string" then
+
+            serializable.wrapInverted[weaponName] = inverted == true
+
+        end
+
+    end
+
+    ensureConfigFolder()
+
+    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, serializable)
+
+    if not ok or type(encoded) ~= "string" then
+
+        return false
+
+    end
+
+    local writeOk = pcall(writefile, CONFIG_FILE, encoded)
+
+    if writeOk and type(queueSyncPublish) == "function" then
+
+        queueSyncPublish()
+
+    end
+
+    return writeOk
+
+end
+
+local function loadConfig()
+
+    if type(readfile) ~= "function" or type(isfile) ~= "function" or not isfile(CONFIG_FILE) then
+
+        return false
+
+    end
+
+    local ok, raw = pcall(readfile, CONFIG_FILE)
+
+    if not ok or type(raw) ~= "string" then
+
+        return false
+
+    end
+
+    local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+
+    if not decodeOk or type(decoded) ~= "table" then
+
+        return false
+
+    end
+
+    State.weapons = {}
+
+    State.emotes = {}
+
+    State.wrapInverted = {}
+
+    if type(decoded.weapons) == "table" then
+
+        for weaponName, selections in pairs(decoded.weapons) do
+
+            if type(weaponName) == "string" and type(selections) == "table" then
+
+                local clean = {}
+
+                for _, kind in ipairs({"Skin", "Wrap", "Charm", "Finisher"}) do
+
+                    local value = selections[kind]
+
+                    if type(value) == "string" then
+
+                        if value == NONE or isSupportedCosmetic(value, kind) then
+
+                            clean[kind] = value
+
+                        end
+
+                    end
+
+                end
+
+                if next(clean) ~= nil then
+
+                    State.weapons[weaponName] = clean
+
+                end
+
+            end
+
+        end
+
+    end
+
+    if type(decoded.emotes) == "table" then
+
+        for slotKey, emoteName in pairs(decoded.emotes) do
+
+            if type(emoteName) == "string" and isSupportedCosmetic(emoteName, "Emote") then
+
+                State.emotes[tostring(slotKey)] = emoteName
+
+            end
+
+        end
+
+    end
+
+    if type(decoded.wrapInverted) == "table" then
+
+        for weaponName, inverted in pairs(decoded.wrapInverted) do
+
+            if type(weaponName) == "string" then
+
+                State.wrapInverted[weaponName] = inverted == true
+
+            end
+
+        end
+
+    end
+
+    return true
+
+end
+
+local function resolveHttpRequest()
+
+    if syncHttpRequest ~= nil then
+
+        return syncHttpRequest or nil
+
+    end
+
+    local environment = _G
+
+    if type(getgenv) == "function" then
+
+        local ok, value = pcall(getgenv)
+
+        if ok and type(value) == "table" then
+
+            environment = value
+
+        end
+
+    end
+
+    local candidates = {
+
+        type(environment) == "table" and environment.request or nil,
+
+        type(environment) == "table" and environment.http_request or nil,
+
+        type(environment) == "table" and environment.httprequest or nil,
+
+        type(environment) == "table" and environment.request_async or nil,
+
+        type(request) == "function" and request or nil,
+
+        type(http_request) == "function" and http_request or nil,
+
+        type(httprequest) == "function" and httprequest or nil,
+
+    }
+
+    if type(syn) == "table" then
+
+        candidates[#candidates + 1] = syn.request
+
+    end
+
+    if type(http) == "table" then
+
+        candidates[#candidates + 1] = http.request
+
+        candidates[#candidates + 1] = http.request_async
+
+    end
+
+    if type(fluxus) == "table" then
+
+        candidates[#candidates + 1] = fluxus.request
+
+    end
+
+    if type(krnl) == "table" then
+
+        candidates[#candidates + 1] = krnl.request
+
+    end
+
+    for _, candidate in ipairs(candidates) do
+
+        if type(candidate) == "function" then
+
+            syncHttpRequest = candidate
+
+            return candidate
+
+        end
+
+    end
+
+    syncHttpRequest = false
+
+    return nil
+
+end
+
+local function writeSyncDiagnostic(data)
+
+    if type(writefile) ~= "function" then
+
+        return
+
+    end
+
+    ensureConfigFolder()
+
+    local ok, encoded =
+
+        pcall(HttpService.JSONEncode, HttpService, data)
+
+    if ok and type(encoded) == "string" then
+
+        pcall(
+
+            writefile,
+
+            CONFIG_FOLDER .. "/sync_status.json",
+
+            encoded
+
+        )
+
+    end
+
+end
+
+local function syncRequest(method, path, body)
+
+    local requester = resolveHttpRequest()
+
+    if type(requester) ~= "function" then
+
+        writeSyncDiagnostic({
+
+            ok = false,
+
+            stage = "resolve_request",
+
+            error = "no_http_request_function",
+
+        })
+
+        return nil
+
+    end
+
+    local options = {
+
+        Url = SYNC_URL .. path,
+
+        URL = SYNC_URL .. path,
+
+        Method = method,
+
+        Headers = {
+
+            ["Content-Type"] = "application/json",
+
+            ["Accept"] = "application/json",
+
+        },
+
+    }
+
+    if body ~= nil then
+
+        local ok, encoded =
+
+            pcall(HttpService.JSONEncode, HttpService, body)
+
+        if not ok then
+
+            writeSyncDiagnostic({
+
+                ok = false,
+
+                stage = "encode",
+
+                error = "json_encode_failed",
+
+            })
+
+            return nil
+
+        end
+
+        options.Body = encoded
+
+    end
+
+    local ok, response = pcall(requester, options)
+
+    if not ok then
+
+        writeSyncDiagnostic({
+
+            ok = false,
+
+            stage = "request",
+
+            error = tostring(response),
+
+            method = method,
+
+            path = path,
+
+        })
+
+        return nil
+
+    end
+
+    if type(response) == "string" then
+
+        local decodeOk, decoded =
+
+            pcall(
+
+                HttpService.JSONDecode,
+
+                HttpService,
+
+                response
+
+            )
+
+        if decodeOk and type(decoded) == "table" then
+
+            writeSyncDiagnostic({
+
+                ok = true,
+
+                stage = "response",
+
+                method = method,
+
+                path = path,
+
+                status = 200,
+
+            })
+
+            return decoded
+
+        end
+
+        writeSyncDiagnostic({
+
+            ok = false,
+
+            stage = "response",
+
+            error = "string_response_not_json",
+
+            method = method,
+
+            path = path,
+
+        })
+
+        return nil
+
+    end
+
+    if type(response) ~= "table" then
+
+        writeSyncDiagnostic({
+
+            ok = false,
+
+            stage = "response",
+
+            error = "unsupported_response_type",
+
+            responseType = typeof(response),
+
+            method = method,
+
+            path = path,
+
+        })
+
+        return nil
+
+    end
+
+    local statusCode =
+
+        tonumber(response.StatusCode)
+
+        or tonumber(response.Status)
+
+        or tonumber(response.status_code)
+
+        or tonumber(response.status)
+
+    local responseBody =
+
+        response.Body
+
+        or response.body
+
+        or response.ResponseBody
+
+    if statusCode and
+
+        (statusCode < 200 or statusCode >= 300) then
+
+        writeSyncDiagnostic({
+
+            ok = false,
+
+            stage = "http_status",
+
+            status = statusCode,
+
+            body = tostring(responseBody or ""),
+
+            method = method,
+
+            path = path,
+
+        })
+
+        return nil
+
+    end
+
+    if type(responseBody) ~= "string"
+
+        or responseBody == "" then
+
+        writeSyncDiagnostic({
+
+            ok = true,
+
+            stage = "response",
+
+            status = statusCode or 200,
+
+            method = method,
+
+            path = path,
+
+            emptyBody = true,
+
+        })
+
+        return {}
+
+    end
+
+    local decodeOk, decoded =
+
+        pcall(
+
+            HttpService.JSONDecode,
+
+            HttpService,
+
+            responseBody
+
+        )
+
+    if not decodeOk or type(decoded) ~= "table" then
+
+        writeSyncDiagnostic({
+
+            ok = false,
+
+            stage = "decode_response",
+
+            status = statusCode or 200,
+
+            body = tostring(responseBody),
+
+            method = method,
+
+            path = path,
+
+        })
+
+        return nil
+
+    end
+
+    writeSyncDiagnostic({
+
+        ok = true,
+
+        stage = "response",
+
+        status = statusCode or 200,
+
+        method = method,
+
+        path = path,
+
+    })
+
+    return decoded
+
+end
+
+local function buildSyncWeapons()
+
+    local weapons = {}
+
+    for weaponName, selections in pairs(State.weapons) do
+
+        if type(weaponName) == "string"
+
+            and type(selections) == "table" then
+
+            local clean = {}
+
+            local syncKinds = SHARE_WRAPS
+
+                and {"Skin", "Wrap", "Charm", "Finisher"}
+
+                or {"Skin", "Charm", "Finisher"}
+
+            for _, kind in ipairs(syncKinds) do
+
+                local cosmeticName = selections[kind]
+
+                if type(cosmeticName) == "string"
+
+                    and cosmeticName ~= NONE
+
+                    and isSupportedCosmetic(
+
+                        cosmeticName,
+
+                        kind
+
+                    ) then
+
+                    clean[kind] = cosmeticName
+
+                end
+
+            end
+
+            if SHARE_WRAPS and clean.Wrap ~= nil then
+
+                clean.WrapInverted =
+
+                    State.wrapInverted[weaponName] == true
+
+            end
+
+            if next(clean) ~= nil then
+
+                weapons[weaponName] = clean
+
+            end
+
+        end
+
+    end
+
+    return weapons
+
+end
+
+local function publishSharedCosmetics()
+
+    if game.JobId == "" then
+
+        return false
+
+    end
+
+    local response = syncRequest(
+
+        "POST",
+
+        "/v1/cosmetics",
+
+        {
+
+            jobId = game.JobId,
+
+            userId = player.UserId,
+
+            weapons = buildSyncWeapons(),
+
+        }
+
+    )
+
+    return type(response) == "table"
+
+        and response.ok == true
+
+end
+
+local function sanitizeSharedWeapons(value)
+
+    if type(value) ~= "table" then
+
+        return {}
+
+    end
+
+    local weapons = {}
+
+    for weaponName, selections in pairs(value) do
+
+        if type(weaponName) == "string"
+
+            and type(selections) == "table" then
+
+            local clean = {}
+
+            local syncKinds = SHARE_WRAPS
+
+                and {"Skin", "Wrap", "Charm", "Finisher"}
+
+                or {"Skin", "Charm", "Finisher"}
+
+            for _, kind in ipairs(syncKinds) do
+
+                local cosmeticName = selections[kind]
+
+                if type(cosmeticName) == "string"
+
+                    and isSupportedCosmetic(
+
+                        cosmeticName,
+
+                        kind
+
+                    ) then
+
+                    clean[kind] = cosmeticName
+
+                end
+
+            end
+
+            if SHARE_WRAPS and clean.Wrap ~= nil then
+
+                clean.WrapInverted =
+
+                    selections.WrapInverted == true
+
+            end
+
+            if next(clean) ~= nil then
+
+                weapons[weaponName] = clean
+
+            end
+
+        end
+
+    end
+
+    return weapons
+
+end
+
+local function refreshSharedCosmetics()
+
+    if game.JobId == "" then
+
+        return false
+
+    end
+
+    local response = syncRequest(
+
+        "GET",
+
+        "/v1/cosmetics?jobId="
+
+            .. HttpService:UrlEncode(game.JobId)
+
+    )
+
+    if type(response) ~= "table"
+
+        or response.ok ~= true
+
+        or type(response.players) ~= "table" then
+
+        return false
+
+    end
+
+    local nextShared = {}
+
+    for userIdString, entry in pairs(response.players) do
+
+        local userId = tonumber(userIdString)
+
+        if userId
+
+            and userId ~= player.UserId
+
+            and type(entry) == "table"
+
+            and type(entry.weapons) == "table" then
+
+            local remotePlayer =
+
+                Players:GetPlayerByUserId(userId)
+
+            if remotePlayer then
+
+                local clean =
+
+                    sanitizeSharedWeapons(entry.weapons)
+
+                if next(clean) ~= nil then
+
+                    nextShared[userId] = clean
+
+                end
+
+            end
+
+        end
+
+    end
+
+    SharedCosmetics = nextShared
+
+    return true
+
+end
+
+local syncPublishToken = 0
+
+queueSyncPublish = function()
+
+    syncPublishToken += 1
+
+    local token = syncPublishToken
+
+    task.delay(0.3, function()
+
+        if token == syncPublishToken then
+
+            publishSharedCosmetics()
+
+        end
+
+    end)
+
+end
+
+local function getSelectionsForPlayer(
+
+    targetPlayer,
+
+    weaponName
+
+)
+
+    if targetPlayer == player then
+
+        return State.weapons[weaponName]
+
+    end
+
+    if typeof(targetPlayer) ~= "Instance"
+
+        or not targetPlayer:IsA("Player") then
+
+        return nil
+
+    end
+
+    local byWeapon =
+
+        SharedCosmetics[targetPlayer.UserId]
+
+    return type(byWeapon) == "table"
+
+        and byWeapon[weaponName]
+
+        or nil
+
+end
+
+local function getWrapInvertedForPlayer(
+
+    targetPlayer,
+
+    weaponName,
+
+    selections
+
+)
+
+    if targetPlayer == player then
+
+        return State.wrapInverted[weaponName] == true
+
+    end
+
+    return type(selections) == "table"
+
+        and selections.WrapInverted == true
+
+        or false
+
+end
+
+local function getSelection(weaponName, kind)
+
+    local selections = State.weapons[weaponName]
+
+    return type(selections) == "table" and selections[kind] or nil
+
+end
+
+local function setSelection(weaponName, kind, cosmeticName)
+
+    kind = normalizeType(kind)
+
+    if type(weaponName) ~= "string" or weaponName == "" or not WEAPON_TYPES[kind] then
+
+        return false
+
+    end
+
+    local normalized = cosmeticName
+
+    if normalized == "NONE_COSMETIC" or normalized == "" or normalized == nil then
+
+        normalized = NONE
+
+    elseif normalized == "RANDOM_COSMETIC" then
+
+        normalized = RANDOM
+
+    end
+
+    if normalized ~= NONE and normalized ~= RANDOM and not isSupportedCosmetic(normalized, kind) then
+
+        return false
+
+    end
+
+    State.weapons[weaponName] = State.weapons[weaponName] or {}
+
+    if normalized == RANDOM then
+
+        State.weapons[weaponName][kind] = nil
+
+    else
+
+        State.weapons[weaponName][kind] = normalized
+
+    end
+
+    if next(State.weapons[weaponName]) == nil then
+
+        State.weapons[weaponName] = nil
+
+    end
+
+    saveConfig()
+
+    return true
+
+end
+
+local CharmViewPayloadCache = {}
+
+local function buildCharmViewPayload(charmName)
+
+    if type(charmName) ~= "string" or not isSupportedCosmetic(charmName, "Charm") then
+
+        return nil
+
+    end
+
+    local cached = CharmViewPayloadCache[charmName]
+
+    if cached then
+
+        return cached
+
+    end
+
+    local payload = {Name = charmName}
+
+    local source = CosmeticLibrary.Cosmetics[charmName]
+
+    if type(source) == "table" and source.Metadata ~= nil then
+
+        payload.Metadata = source.Metadata
+
+    end
+
+    CharmViewPayloadCache[charmName] = payload
+
+    return payload
+
+end
+
+local function buildCosmeticData(existingData, cosmeticName, cosmeticType)
+
+    if cosmeticName == NONE then
+
+        return nil
+
+    end
+
+    if not isSupportedCosmetic(cosmeticName, cosmeticType) then
+
+        return existingData
+
+    end
+
+    local source = CosmeticLibrary.Cosmetics[cosmeticName]
+
+    local data = {}
+
+    if type(source) == "table" then
+
+        for key, value in pairs(source) do
+
+            data[key] = value
+
+        end
+
+    elseif type(existingData) == "table" then
+
+        for key, value in pairs(existingData) do
+
+            data[key] = value
+
+        end
+
+    end
+
+    data.Name = cosmeticName
+
+    data.Type = data.Type or cosmeticType
+
+    data.Seed = data.Seed or math.random(1, 1000000)
+
+    if EnumLibrary and type(EnumLibrary.ToEnum) == "function" then
+
+        local ok, enumValue = pcall(EnumLibrary.ToEnum, EnumLibrary, cosmeticName)
+
+        if ok and enumValue ~= nil then
+
+            data.Enum = enumValue
+
+            data.ObjectID = enumValue
+
+        end
+
+    end
+
+    if data.Inverted == nil then
+
+        data.Inverted = false
+
+    end
+
+    return data
+
+end
+
+local allItemNames = {}
+
+for itemName in pairs(ItemLibrary.Items or {}) do
+
+    if type(itemName) == "string" and itemName ~= "" then
+
+        allItemNames[itemName] = true
+
+    end
+
+end
+
+local UnlockOverlay = {}
+
+for cosmeticName, cosmeticType in pairs(AllowedCosmeticType) do
+
+    if cosmeticType == "Skin" or cosmeticType == "Emote" then
+
+        UnlockOverlay[cosmeticName] = true
+
+    elseif cosmeticType == "Wrap"
+
+        or cosmeticType == "Charm"
+
+        or cosmeticType == "Finisher" then
+
+        UnlockOverlay[cosmeticName] = allItemNames
+
+    end
+
+end
+
+local CachedUnlockedInventory = nil
+
+local CachedUnlockedBase = nil
+
+local function buildUnlockedInventory(base)
+
+    if CachedUnlockedInventory and CachedUnlockedBase == base then
+
+        return CachedUnlockedInventory
+
+    end
+
+    local result = {}
+
+    if type(base) == "table" then
+
+        for key, value in pairs(base) do
+
+            result[key] = value
+
+        end
+
+    end
+
+    for cosmeticName, value in pairs(UnlockOverlay) do
+
+        result[cosmeticName] = value
+
+    end
+
+    CachedUnlockedBase = base
+
+    CachedUnlockedInventory = result
+
+    return result
+
+end
+
+local originalOwnsCosmeticNormally = CosmeticLibrary.OwnsCosmeticNormally
+
+local originalOwnsCosmetic = CosmeticLibrary.OwnsCosmetic
+
+local function universalOwnership(self, inventory, name, weapon)
+
+    if isSupportedCosmetic(name) then
+
+        return true
+
+    end
+
+    if type(originalOwnsCosmeticNormally) == "function" then
+
+        local ok, result = pcall(originalOwnsCosmeticNormally, self, inventory, name, weapon)
+
+        if ok then
+
+            return result
+
+        end
+
+    end
+
+    return false
+
+end
+
+CosmeticLibrary.OwnsCosmeticNormally = universalOwnership
+
+CosmeticLibrary.OwnsCosmeticUniversally = universalOwnership
+
+CosmeticLibrary.OwnsCosmeticForWeapon = universalOwnership
+
+CosmeticLibrary.OwnsCosmetic = function(self, inventory, name, weapon)
+
+    if type(name) == "string" and not name:find("MISSING_", 1, true) and isSupportedCosmetic(name) then
+
+        return true
+
+    end
+
+    if type(originalOwnsCosmetic) == "function" then
+
+        return originalOwnsCosmetic(self, inventory, name, weapon)
+
+    end
+
+    return false
+
+end
+
+local originalGet = DataController.Get
+
+local function getRawData(key)
+
+    local ok, value = pcall(originalGet, DataController, key)
+
+    if ok then
+
+        return value
+
+    end
+
+    return nil
+
+end
+
+local function applySelectionToWeaponData(weaponName, weaponData)
+
+    if type(weaponData) ~= "table" then
+
+        return weaponData
+
+    end
+
+    local selections = State.weapons[weaponName]
+
+    if type(selections) ~= "table" then
+
+        return weaponData
+
+    end
+
+    for _, kind in ipairs({"Skin", "Wrap", "Charm", "Finisher"}) do
+
+        local selectedName = selections[kind]
+
+        if selectedName ~= nil then
+
+            if selectedName == NONE then
+
+                weaponData[kind] = nil
+
+            else
+
+                local nextData = buildCosmeticData(weaponData[kind], selectedName, kind)
+
+                if kind == "Wrap" and type(nextData) == "table" then
+
+                    nextData.Inverted = State.wrapInverted[weaponName] == true
+
+                end
+
+                weaponData[kind] = nextData
+
+            end
+
+        end
+
+    end
+
+    return weaponData
+
+end
+
+local function applyWeaponInventory()
+
+    local inventory = getRawData("WeaponInventory")
+
+    if type(inventory) ~= "table" then
+
+        return false
+
+    end
+
+    local changed = false
+
+    for _, weaponData in pairs(inventory) do
+
+        if type(weaponData) == "table" and type(weaponData.Name) == "string" then
+
+            if State.weapons[weaponData.Name] then
+
+                applySelectionToWeaponData(weaponData.Name, weaponData)
+
+                changed = true
+
+            end
+
+        end
+
+    end
+
+    local currentData = DataController.CurrentData
+
+    if changed and currentData and type(currentData.Replicate) == "function" then
+
+        pcall(currentData.Replicate, currentData, "WeaponInventory")
+
+    end
+
+    return changed
+
+end
+
+DataController.Get = function(self, key)
+
+    local data = originalGet(self, key)
+
+    if key == "CosmeticInventory" then
+
+        return buildUnlockedInventory(data)
+
+    end
+
+    if key == "WeaponInventory" and type(data) == "table" then
+
+        for _, weaponData in pairs(data) do
+
+            if type(weaponData) == "table" and type(weaponData.Name) == "string" then
+
+                applySelectionToWeaponData(weaponData.Name, weaponData)
+
+            end
+
+        end
+
+        return data
+
+    end
+
+    return data
+
+end
+
+local originalGetWeaponData = DataController.GetWeaponData
+
+DataController.GetWeaponData = function(self, weaponName)
+
+    local data = originalGetWeaponData(self, weaponName)
+
+    if type(data) ~= "table" then
+
+        return data
+
+    end
+
+    local merged = table.clone(data)
+
+    merged.Name = weaponName
+
+    return applySelectionToWeaponData(weaponName, merged)
+
+end
+
+local function triggerDataChanged(fieldName)
+
+    local currentData = DataController.CurrentData
+
+    if type(currentData) ~= "table" then
+
+        return false
+
+    end
+
+    local events = rawget(currentData, "_value_changed_events")
+
+    local signal = type(events) == "table" and events[fieldName] or nil
+
+    if type(signal) == "table" and type(signal.Fire) == "function" then
+
+        local ok = pcall(signal.Fire, signal)
+
+        return ok
+
+    end
+
+    return false
+
+end
+
+local Equipment = nil
+
+local function resolveEquipment()
+
+    if Equipment then
+
+        return Equipment
+
+    end
+
+    local uiModules = playerScripts:FindFirstChild("Modules")
+
+    local userInterface = uiModules and uiModules:FindFirstChild("UserInterface")
+
+    local equipmentModule = userInterface and userInterface:FindFirstChild("Equipment")
+
+    Equipment = safeRequire(equipmentModule)
+
+    return Equipment
+
+end
+
+local function readEquipmentStateValue(fieldName)
+
+    local equipment = resolveEquipment()
+
+    local equipmentState = type(equipment) == "table" and rawget(equipment, "EquipmentState") or nil
+
+    if type(equipmentState) ~= "table" then
+
+        return nil
+
+    end
+
+    local ok, value = pcall(function()
+
+        return equipmentState[fieldName]
+
+    end)
+
+    return ok and value or nil
+
+end
+
+local function captureNativeSelection(invertedOverride)
+
+    local weaponName = normalizeName(readEquipmentStateValue("SelectedWeapon"))
+
+    local cosmeticType = normalizeType(readEquipmentStateValue("CustomizingType"))
+
+    local cosmeticName = normalizeName(readEquipmentStateValue("SelectedCosmetic"))
+
+    if type(weaponName) ~= "string" or weaponName == "" or not WEAPON_TYPES[cosmeticType] then
+
+        return false
+
+    end
+
+    if type(cosmeticName) ~= "string" or cosmeticName == "" or cosmeticName == "NONE_COSMETIC" then
+
+        cosmeticName = NONE
+
+    elseif cosmeticName == "RANDOM_COSMETIC" then
+
+        cosmeticName = RANDOM
+
+    end
+
+    if cosmeticName ~= NONE and cosmeticName ~= RANDOM then
+
+        if not isSupportedCosmetic(cosmeticName, cosmeticType) then
+
+            return false
+
+        end
+
+    end
+
+    if cosmeticType == "Wrap" then
+
+        local inverted = invertedOverride
+
+        if inverted == nil then
+
+            local nativeInverted = readEquipmentStateValue("CosmeticInverted")
+
+            inverted = nativeInverted == true
+
+        end
+
+        State.wrapInverted[weaponName] = inverted == true
+
+    end
+
+    local changed = setSelection(weaponName, cosmeticType, cosmeticName)
+
+    if changed then
+
+        applyWeaponInventory()
+
+        triggerDataChanged("WeaponInventory")
+
+        triggerDataChanged("WeaponData")
+
+    end
+
+    return changed
+
+end
+
+local function resolveCosmeticSlot()
+
+    local psModules = playerScripts:FindFirstChild("Modules")
+
+    return safeRequire(psModules and psModules:FindFirstChild("CosmeticSlot"))
+
+end
+
+local function ensureNativeCosmeticSlotBinding()
+
+    if nativeSlotBound then
+
+        return true
+
+    end
+
+    local cosmeticSlot = resolveCosmeticSlot()
+
+    local constructor = type(cosmeticSlot) == "table" and rawget(cosmeticSlot, "new") or nil
+
+    if type(constructor) ~= "function"
+
+        or type(debug.getupvalue) ~= "function"
+
+        or type(debug.setupvalue) ~= "function" then
+
+        return false
+
+    end
+
+    local prototype = debug.getupvalue(constructor, 1)
+
+    if type(prototype) ~= "table" then
+
+        return false
+
+    end
+
+    local proxy = {}
+
+    proxy.__index = function(instance, key)
+
+        if key ~= "Frame" then
+
+            return rawget(prototype, key)
+
+        end
+
+        if type(debug.info) == "function" and type(debug.getupvalues) == "function" then
+
+            local source, caller = debug.info(2, "sf")
+
+            local upvalues = type(caller) == "function" and debug.getupvalues(caller) or nil
+
+            if type(source) == "string"
+
+                and source:match("Cosmetics$")
+
+                and type(upvalues) == "table"
+
+                and type(upvalues[9]) == "boolean" then
+
+                pcall(debug.setupvalue, caller, 9, false)
+
+            end
+
+        end
+
+        return rawget(instance, SLOT_FRAME_SENTINEL)
+
+    end
+
+    proxy.__newindex = function(instance, key, value)
+
+        if key ~= "Frame" then
+
+            rawset(instance, key, value)
+
+            return
+
+        end
+
+        local source = type(debug.info) == "function" and debug.info(3, "s") or nil
+
+        if type(source) == "string"
+
+            and source:match("Cosmetics$")
+
+            and rawget(instance, "IsLocked") ~= true
+
+            and value ~= nil then
+
+            local button = value:FindFirstChild("Button")
+
+            if button ~= nil then
+
+                button.MouseButton1Click:Connect(function()
+
+                    task.defer(captureNativeSelection)
+
+                end)
+
+            end
+
+        end
+
+        rawset(instance, SLOT_FRAME_SENTINEL, value)
+
+    end
+
+    local ok = pcall(debug.setupvalue, constructor, 1, proxy)
+
+    if not ok then
+
+        return false
+
+    end
+
+    nativeSlotBound = true
+
+    return true
+
+end
+
+local function ensureNativeInvertedState()
+
+    if equipmentStateHooked then
+
+        return true
+
+    end
+
+    local equipment = resolveEquipment()
+
+    local equipmentState = type(equipment) == "table" and rawget(equipment, "EquipmentState") or nil
+
+    local originalMetatable = type(equipmentState) == "table" and getmetatable(equipmentState) or nil
+
+    if type(equipmentState) ~= "table" or type(originalMetatable) ~= "table" then
+
+        return false
+
+    end
+
+    local originalIndex = rawget(originalMetatable, "__index")
+
+    local originalNewIndex = rawget(originalMetatable, "__newindex")
+
+    local nextMetatable = {}
+
+    for key, value in pairs(originalMetatable) do
+
+        nextMetatable[key] = value
+
+    end
+
+    nextMetatable.__index = function(target, key)
+
+        if key == "CosmeticInverted" then
+
+            local weaponName = normalizeName(rawget(target, "SelectedWeapon"))
+
+            if type(weaponName) == "string" and State.wrapInverted[weaponName] ~= nil then
+
+                return State.wrapInverted[weaponName] == true
+
+            end
+
+        end
+
+        if type(originalIndex) == "table" then
+
+            return originalIndex[key]
+
+        elseif type(originalIndex) == "function" then
+
+            return originalIndex(target, key)
+
+        end
+
+        return rawget(target, key)
+
+    end
+
+    nextMetatable.__newindex = function(target, key, value)
+
+        if key == "CosmeticInverted" and value ~= nil then
+
+            local weaponName = normalizeName(rawget(target, "SelectedWeapon"))
+
+            if type(weaponName) == "string" and weaponName ~= "" then
+
+                State.wrapInverted[weaponName] = value == true
+
+                saveConfig()
+
+                task.defer(function()
+
+                    captureNativeSelection(value == true)
+
+                end)
+
+            end
+
+            rawset(target, key, value)
+
+            return
+
+        end
+
+        if type(originalNewIndex) == "function" then
+
+            return originalNewIndex(target, key, value)
+
+        end
+
+        rawset(target, key, value)
+
+    end
+
+    local ok = pcall(setmetatable, equipmentState, nextMetatable)
+
+    if ok then
+
+        equipmentStateHooked = true
+
+    end
+
+    return ok
+
+end
+
+-- Fallback capture path used by the original working script.
+
+if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+
+    pcall(function()
+
+        local remotes = ReplicatedStorage:WaitForChild("Remotes")
+
+        local dataRemotes = remotes:WaitForChild("Data")
+
+        local equipRemote = dataRemotes:WaitForChild("EquipCosmetic")
+
+        local oldNamecall
+
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+
+            local method = getnamecallmethod()
+
+            if method == "FireServer" and self == equipRemote then
+
+                local args = {...}
+
+                local weaponName = args[1]
+
+                local cosmeticType = normalizeType(args[2])
+
+                local cosmeticName = normalizeName(args[3])
+
+                local options = type(args[4]) == "table" and args[4] or {}
+
+                local realType =
+
+                    type(cosmeticName) == "string"
+
+                    and AllowedCosmeticType[cosmeticName]
+
+                    or nil
+
+                if WEAPON_TYPES[realType] then
+
+                    cosmeticType = realType
+
+                end
+
+                if WEAPON_TYPES[cosmeticType] then
+
+                    if cosmeticType == "Wrap" then
+
+                        State.wrapInverted[weaponName] = options.IsInverted == true
+
+                    end
+
+                    if setSelection(weaponName, cosmeticType, cosmeticName) then
+
+                        task.defer(function()
+
+                            applyWeaponInventory()
+
+                            triggerDataChanged("WeaponInventory")
+
+                            triggerDataChanged("CosmeticInventory")
+
+                        end)
+
+                        return nil
+
+                    end
+
+                end
+
+            end
+
+            return oldNamecall(self, ...)
+
+        end)
+
+    end)
+
+end
+
+-- Viewmodel hooks from the supplied working code, extended with Charms.
+
+local ClientItemModule =
+
+    playerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem
+
+local ClientItem = require(ClientItemModule)
+
+local ClientViewModel = require(ClientItemModule:WaitForChild("ClientViewModel"))
+
+local originalCreateViewModel = ClientItem._CreateViewModel
+
+ClientItem._CreateViewModel = function(self, viewmodelRef)
+
+    local weaponName = self.Name
+
+    local weaponPlayer = self.ClientFighter and self.ClientFighter.Player
+
+    local selections = getSelectionsForPlayer(weaponPlayer, weaponName)
+
+    if type(selections) == "table" and viewmodelRef then
+
+        local dataKey = self:ToEnum("Data")
+
+        local target = viewmodelRef[dataKey] or viewmodelRef.Data
+
+        if type(target) == "table" then
+
+            local skinName = selections.Skin
+
+            if skinName and skinName ~= NONE then
+
+                local skinData = buildCosmeticData(nil, skinName, "Skin")
+
+                if skinData then
+
+                    target[self:ToEnum("Skin") or "Skin"] = skinData
+
+                    target[self:ToEnum("Name") or "Name"] = skinName
+
+                end
+
+            elseif skinName == NONE then
+
+                target[self:ToEnum("Skin") or "Skin"] = nil
+
+                target[self:ToEnum("Name") or "Name"] = weaponName
+
+            end
+
+            local wrapName = selections.Wrap
+
+            if wrapName and wrapName ~= NONE then
+
+                local wrapData = buildCosmeticData(nil, wrapName, "Wrap")
+
+                if wrapData then
+
+                    wrapData.Inverted =
+
+                        getWrapInvertedForPlayer(
+
+                            weaponPlayer,
+
+                            weaponName,
+
+                            selections
+
+                        )
+
+                    target[self:ToEnum("Wrap") or "Wrap"] = wrapData
+
+                end
+
+            elseif wrapName == NONE then
+
+                target[self:ToEnum("Wrap") or "Wrap"] = nil
+
+            end
+
+            local charmName = selections.Charm
+
+            if charmName and charmName ~= NONE then
+
+                target[self:ToEnum("Charm") or "Charm"] =
+
+                    buildCharmViewPayload(charmName)
+
+            elseif charmName == NONE then
+
+                target[self:ToEnum("Charm") or "Charm"] = nil
+
+            end
+
+        end
+
+    end
+
+    return originalCreateViewModel(self, viewmodelRef)
+
+end
+
+if type(ClientViewModel.GetWrap) == "function" then
+
+    local originalGetWrap = ClientViewModel.GetWrap
+
+    ClientViewModel.GetWrap = function(self)
+
+        local weaponName = self.ClientItem and self.ClientItem.Name
+
+        local weaponPlayer =
+
+            self.ClientItem
+
+            and self.ClientItem.ClientFighter
+
+            and self.ClientItem.ClientFighter.Player
+
+        local selections =
+
+            weaponName
+
+            and getSelectionsForPlayer(
+
+                weaponPlayer,
+
+                weaponName
+
+            )
+
+            or nil
+
+        local wrapName =
+
+            type(selections) == "table"
+
+            and selections.Wrap
+
+            or nil
+
+        if wrapName and wrapName ~= NONE then
+
+            local wrapData =
+
+                buildCosmeticData(nil, wrapName, "Wrap")
+
+            if wrapData then
+
+                wrapData.Inverted =
+
+                    getWrapInvertedForPlayer(
+
+                        weaponPlayer,
+
+                        weaponName,
+
+                        selections
+
+                    )
+
+                return wrapData
+
+            end
+
+        end
+
+        return originalGetWrap(self)
+
+    end
+
+end
+
+local originalClientViewModelNew = ClientViewModel.new
+
+ClientViewModel.new = function(replicatedData, clientItem)
+
+    local weaponPlayer =
+
+        clientItem.ClientFighter
+
+        and clientItem.ClientFighter.Player
+
+    local weaponName = clientItem.Name
+
+    local selections = getSelectionsForPlayer(weaponPlayer, weaponName)
+
+    if type(selections) == "table" then
+
+        local ReplicatedClass = require(modules.ReplicatedClass)
+
+        local dataKey = ReplicatedClass:ToEnum("Data")
+
+        replicatedData[dataKey] = replicatedData[dataKey] or {}
+
+        local data = replicatedData[dataKey]
+
+        if selections.Skin and selections.Skin ~= NONE then
+
+            data[ReplicatedClass:ToEnum("Skin")] =
+
+                buildCosmeticData(nil, selections.Skin, "Skin")
+
+        end
+
+        if selections.Wrap and selections.Wrap ~= NONE then
+
+            local wrapData = buildCosmeticData(nil, selections.Wrap, "Wrap")
+
+            if wrapData then
+
+                wrapData.Inverted = State.wrapInverted[weaponName] == true
+
+                data[ReplicatedClass:ToEnum("Wrap")] = wrapData
+
+            end
+
+        end
+
+        if selections.Charm and selections.Charm ~= NONE then
+
+            data[ReplicatedClass:ToEnum("Charm")] =
+
+                buildCharmViewPayload(selections.Charm)
+
+        end
+
+    end
+
+    local result = originalClientViewModelNew(replicatedData, clientItem)
+
+    if result and type(selections) == "table" then
+
+        if selections.Wrap and selections.Wrap ~= NONE and type(result._UpdateWrap) == "function" then
+
+            pcall(result._UpdateWrap, result)
+
+        end
+
+        if selections.Charm and selections.Charm ~= NONE then
+
+            local charmPayload = buildCharmViewPayload(selections.Charm)
+
+            if type(result.SetCharm) == "function" then
+
+                pcall(result.SetCharm, result, charmPayload)
+
+            end
+
+            if type(result._UpdateCharm) == "function" then
+
+                pcall(result._UpdateCharm, result)
+
+            end
+
+        end
+
+    end
+
+    return result
+
+end
+
+local FighterController = safeRequire(controllers:FindFirstChild("FighterController"))
+
+local function resolveLocalFighter()
+
+    if type(FighterController) ~= "table" then
+
+        return nil
+
+    end
+
+    if type(FighterController.LocalFighter) == "table" then
+
+        return FighterController.LocalFighter
+
+    end
+
+    if type(FighterController.GetFighter) == "function" then
+
+        local ok, fighter = pcall(FighterController.GetFighter, FighterController, player)
+
+        if ok and fighter then
+
+            return fighter
+
+        end
+
+        if player.Character then
+
+            ok, fighter = pcall(
+
+                FighterController.GetFighter,
+
+                FighterController,
+
+                player.Character
+
+            )
+
+            if ok and fighter then
+
+                return fighter
+
+            end
+
+        end
+
+    end
+
+    return nil
+
+end
+
+local function ensureFinisherHook()
+
+    if finisherHooked then
+
+        return true
+
+    end
+
+    local replicated = playerScripts.Modules:FindFirstChild("ClientReplicatedClasses")
+
+    local ClientEntity = safeRequire(replicated and replicated:FindFirstChild("ClientEntity"))
+
+    if type(ClientEntity) ~= "table" or type(ClientEntity._PlayFinisher) ~= "function" then
+
+        return false
+
+    end
+
+    local originalPlayFinisher = ClientEntity._PlayFinisher
+
+    ClientEntity._PlayFinisher = function(self, finisherName, ...)
+
+        local fighter = resolveLocalFighter()
+
+        local item = fighter and fighter.EquippedItem
+
+        local weaponName = item and item.Name
+
+        local selected =
+
+            type(weaponName) == "string"
+
+            and getSelection(weaponName, "Finisher")
+
+            or nil
+
+        if selected and selected ~= NONE and isSupportedCosmetic(selected, "Finisher") then
+
+            return originalPlayFinisher(self, selected, ...)
+
+        end
+
+        return originalPlayFinisher(self, finisherName, ...)
+
+    end
+
+    finisherHooked = true
+
+    return true
+
+end
+
+local Constants = safeRequire(modules:FindFirstChild("CONSTANTS"))
+
+local MAX_EMOTES =
+
+    type(Constants) == "table"
+
+    and tonumber(Constants.MAX_EQUIPPABLE_EMOTES)
+
+    or 8
+
+MAX_EMOTES = math.max(1, math.floor(MAX_EMOTES))
+
+local function getRawCosmeticInventory()
+
+    local raw = getRawData("CosmeticInventory")
+
+    return type(raw) == "table" and raw or {}
+
+end
+
+local function isNaturallyOwnedEmote(emoteName)
+
+    if not isSupportedCosmetic(emoteName, "Emote") then
+
+        return false
+
+    end
+
+    local rawInventory = getRawCosmeticInventory()
+
+    local value = rawInventory[emoteName]
+
+    return value ~= nil and value ~= false
+
+end
+
+local function buildEmoteData(emoteName)
+
+    return buildCosmeticData(nil, emoteName, "Emote")
+
+end
+
+local function resolveEquippedEmotes()
+
+    local currentData = DataController.CurrentData
+
+    if not currentData then
+
+        return nil, nil
+
+    end
+
+    if type(currentData.Get) == "function" then
+
+        local ok, equipped = pcall(currentData.Get, currentData, "EquippedEmotes")
+
+        if ok and type(equipped) == "table" then
+
+            return currentData, equipped
+
+        end
+
+    end
+
+    local data = type(currentData.Data) == "table" and currentData.Data or nil
+
+    if not data then
+
+        return currentData, nil
+
+    end
+
+    if type(data.EquippedEmotes) ~= "table" then
+
+        data.EquippedEmotes = {}
+
+    end
+
+    return currentData, data.EquippedEmotes
+
+end
+
+local function setEquippedEmote(slotKey, emoteName, persist)
+
+    local numericSlot = math.floor(tonumber(slotKey) or 0)
+
+    if numericSlot < 1 or numericSlot > MAX_EMOTES then
+
+        return false
+
+    end
+
+    if not isSupportedCosmetic(emoteName, "Emote") then
+
+        return false
+
+    end
+
+    local currentData, equipped = resolveEquippedEmotes()
+
+    if not currentData or type(equipped) ~= "table" then
+
+        return false
+
+    end
+
+    local slotString = tostring(numericSlot)
+
+    equipped[numericSlot] = nil
+
+    equipped[slotString] = buildEmoteData(emoteName)
+
+    State.emotes[slotString] = emoteName
+
+    if type(currentData.Replicate) == "function" then
+
+        pcall(currentData.Replicate, currentData, "EquippedEmotes")
+
+    end
+
+    if persist ~= false then
+
+        saveConfig()
+
+    end
+
+    return true
+
+end
+
+local function applySavedEmotes()
+
+    local applied = false
+
+    for slotKey, emoteName in pairs(State.emotes) do
+
+        if setEquippedEmote(slotKey, emoteName, false) then
+
+            applied = true
+
+        end
+
+    end
+
+    return applied
+
+end
+
+local function resolveLocalEntity()
+
+    local fighter = resolveLocalFighter()
+
+    return type(fighter) == "table" and fighter.Entity or nil
+
+end
+
+local function playLocalEmote(emoteName)
+
+    if not isSupportedCosmetic(emoteName, "Emote") then
+
+        return false
+
+    end
+
+    local entity = resolveLocalEntity()
+
+    if type(entity) ~= "table" or type(entity.PlayEmote) ~= "function" then
+
+        return false
+
+    end
+
+    local data = buildEmoteData(emoteName)
+
+    if type(data) ~= "table" then
+
+        return false
+
+    end
+
+    local ok = pcall(entity.PlayEmote, entity, data)
+
+    return ok == true
+
+end
+
+local function ensureEmoteControllerHook()
+
+    if emoteControllerHooked then
+
+        return true
+
+    end
+
+    local EmoteController = safeRequire(controllers:FindFirstChild("EmoteController"))
+
+    if type(EmoteController) ~= "table"
+
+        or type(EmoteController.EquipEmote) ~= "function"
+
+        or type(EmoteController.UseEmoteByName) ~= "function" then
+
+        return false
+
+    end
+
+    local originalEquipEmote = EmoteController.EquipEmote
+
+    local originalUseEmoteByName = EmoteController.UseEmoteByName
+
+    EmoteController.EquipEmote = function(self, slotKey, emoteName, ...)
+
+        if isSupportedCosmetic(emoteName, "Emote")
+
+            and not isNaturallyOwnedEmote(emoteName)
+
+            and setEquippedEmote(slotKey, emoteName, true) then
+
+            return
+
+        end
+
+        return originalEquipEmote(self, slotKey, emoteName, ...)
+
+    end
+
+    EmoteController.UseEmoteByName = function(self, emoteName, ...)
+
+        if isSupportedCosmetic(emoteName, "Emote")
+
+            and not isNaturallyOwnedEmote(emoteName)
+
+            and playLocalEmote(emoteName) then
+
+            return
+
+        end
+
+        return originalUseEmoteByName(self, emoteName, ...)
+
+    end
+
+    emoteControllerHooked = true
+
+    return true
+
+end
+
+local function applyAll()
+
+    applyWeaponInventory()
+
+    applySavedEmotes()
+
+    ensureNativeCosmeticSlotBinding()
+
+    ensureNativeInvertedState()
+
+    ensureFinisherHook()
+
+    ensureEmoteControllerHook()
+
+    triggerDataChanged("CosmeticInventory")
+
+    triggerDataChanged("WeaponInventory")
+
+end
+
+loadConfig()
+
+if playerDataAddedConnection == nil then
+
+    local playerDataAdded = rawget(DataController, "PlayerDataAdded")
+
+    if type(playerDataAdded) == "table"
+
+        and type(playerDataAdded.Connect) == "function" then
+
+        playerDataAddedConnection = playerDataAdded:Connect(function()
+
+            CachedUnlockedInventory = nil
+
+            CachedUnlockedBase = nil
+
+            task.defer(applyAll)
+
+        end)
+
+    end
+
+end
+
+task.defer(applyAll)
+
+task.defer(function()
+
+    publishSharedCosmetics()
+
+    refreshSharedCosmetics()
+
+end)
+
+task.spawn(function()
+
+    local nextHeartbeat = 0
+
+    while task.wait(SYNC_POLL_SECONDS) do
+
+        refreshSharedCosmetics()
+
+        local now = os.clock()
+
+        if now >= nextHeartbeat then
+
+            publishSharedCosmetics()
+
+            nextHeartbeat =
+
+                now + SYNC_HEARTBEAT_SECONDS
+
+        end
+
+    end
+
+end)
+----aim assist---
+task.wait(10)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local DebugController = require(Players.LocalPlayer.PlayerScripts.Controllers:WaitForChild("DebugController"))
+DebugController:SetHandicapsEnabled(true)
