@@ -110,15 +110,17 @@ local State = {
 
 local SYNC_URL = "https://rivals-cosmetics-sync.gomesmarco2008.workers.dev"
 
-local SYNC_POLL_SECONDS = 5
-
-local SYNC_HEARTBEAT_SECONDS = 25
+-- Incremental sync: after the first fetch, the Worker only returns
+-- players whose shared cosmetics changed since our last cursor.
+local SYNC_POLL_SECONDS = 12
 
 -- false = your own wraps still work locally, but wraps are never shared
 -- through Cloudflare and spoofed wraps from other users are ignored.
 local SHARE_WRAPS = false
 
 local SharedCosmetics = {}
+local SharedUpdatedAt = {}
+local syncCursor = 0
 
 local syncHttpRequest = nil
 
@@ -628,312 +630,86 @@ local function resolveHttpRequest()
 
 end
 
-local function writeSyncDiagnostic(data)
-
-    if type(writefile) ~= "function" then
-
-        return
-
-    end
-
-    ensureConfigFolder()
-
-    local ok, encoded =
-
-        pcall(HttpService.JSONEncode, HttpService, data)
-
-    if ok and type(encoded) == "string" then
-
-        pcall(
-
-            writefile,
-
-            CONFIG_FOLDER .. "/sync_status.json",
-
-            encoded
-
-        )
-
-    end
-
-end
-
 local function syncRequest(method, path, body)
-
     local requester = resolveHttpRequest()
 
     if type(requester) ~= "function" then
-
-        writeSyncDiagnostic({
-
-            ok = false,
-
-            stage = "resolve_request",
-
-            error = "no_http_request_function",
-
-        })
-
         return nil
-
     end
 
     local options = {
-
         Url = SYNC_URL .. path,
-
         URL = SYNC_URL .. path,
-
         Method = method,
-
         Headers = {
-
             ["Content-Type"] = "application/json",
-
             ["Accept"] = "application/json",
-
         },
-
     }
 
     if body ~= nil then
-
-        local ok, encoded =
-
+        local encodeOk, encoded =
             pcall(HttpService.JSONEncode, HttpService, body)
 
-        if not ok then
-
-            writeSyncDiagnostic({
-
-                ok = false,
-
-                stage = "encode",
-
-                error = "json_encode_failed",
-
-            })
-
+        if not encodeOk then
             return nil
-
         end
 
         options.Body = encoded
-
     end
 
     local ok, response = pcall(requester, options)
 
     if not ok then
-
-        writeSyncDiagnostic({
-
-            ok = false,
-
-            stage = "request",
-
-            error = tostring(response),
-
-            method = method,
-
-            path = path,
-
-        })
-
         return nil
-
     end
 
     if type(response) == "string" then
-
         local decodeOk, decoded =
+            pcall(HttpService.JSONDecode, HttpService, response)
 
-            pcall(
-
-                HttpService.JSONDecode,
-
-                HttpService,
-
-                response
-
-            )
-
-        if decodeOk and type(decoded) == "table" then
-
-            writeSyncDiagnostic({
-
-                ok = true,
-
-                stage = "response",
-
-                method = method,
-
-                path = path,
-
-                status = 200,
-
-            })
-
-            return decoded
-
-        end
-
-        writeSyncDiagnostic({
-
-            ok = false,
-
-            stage = "response",
-
-            error = "string_response_not_json",
-
-            method = method,
-
-            path = path,
-
-        })
-
-        return nil
-
+        return decodeOk
+            and type(decoded) == "table"
+            and decoded
+            or nil
     end
 
     if type(response) ~= "table" then
-
-        writeSyncDiagnostic({
-
-            ok = false,
-
-            stage = "response",
-
-            error = "unsupported_response_type",
-
-            responseType = typeof(response),
-
-            method = method,
-
-            path = path,
-
-        })
-
         return nil
-
     end
 
     local statusCode =
-
         tonumber(response.StatusCode)
-
         or tonumber(response.Status)
-
         or tonumber(response.status_code)
-
         or tonumber(response.status)
+        or 200
 
-    local responseBody =
-
-        response.Body
-
-        or response.body
-
-        or response.ResponseBody
-
-    if statusCode and
-
-        (statusCode < 200 or statusCode >= 300) then
-
-        writeSyncDiagnostic({
-
-            ok = false,
-
-            stage = "http_status",
-
-            status = statusCode,
-
-            body = tostring(responseBody or ""),
-
-            method = method,
-
-            path = path,
-
-        })
-
+    if statusCode < 200 or statusCode >= 300 then
         return nil
-
     end
 
+    local responseBody =
+        response.Body
+        or response.body
+        or response.ResponseBody
+
     if type(responseBody) ~= "string"
-
         or responseBody == "" then
-
-        writeSyncDiagnostic({
-
-            ok = true,
-
-            stage = "response",
-
-            status = statusCode or 200,
-
-            method = method,
-
-            path = path,
-
-            emptyBody = true,
-
-        })
-
         return {}
-
     end
 
     local decodeOk, decoded =
-
         pcall(
-
             HttpService.JSONDecode,
-
             HttpService,
-
             responseBody
-
         )
 
-    if not decodeOk or type(decoded) ~= "table" then
-
-        writeSyncDiagnostic({
-
-            ok = false,
-
-            stage = "decode_response",
-
-            status = statusCode or 200,
-
-            body = tostring(responseBody),
-
-            method = method,
-
-            path = path,
-
-        })
-
-        return nil
-
-    end
-
-    writeSyncDiagnostic({
-
-        ok = true,
-
-        stage = "response",
-
-        status = statusCode or 200,
-
-        method = method,
-
-        path = path,
-
-    })
-
-    return decoded
-
+    return decodeOk
+        and type(decoded) == "table"
+        and decoded
+        or nil
 end
 
 local function buildSyncWeapons()
@@ -1097,73 +873,61 @@ local function sanitizeSharedWeapons(value)
 end
 
 local function refreshSharedCosmetics()
-
     if game.JobId == "" then
-
         return false
-
     end
 
-    local response = syncRequest(
-
-        "GET",
-
+    local path =
         "/v1/cosmetics?jobId="
+        .. HttpService:UrlEncode(game.JobId)
+        .. "&since="
+        .. tostring(syncCursor)
 
-            .. HttpService:UrlEncode(game.JobId)
-
-    )
+    local response = syncRequest("GET", path)
 
     if type(response) ~= "table"
-
         or response.ok ~= true
-
         or type(response.players) ~= "table" then
-
         return false
-
     end
 
-    local nextShared = {}
-
     for userIdString, entry in pairs(response.players) do
-
         local userId = tonumber(userIdString)
 
         if userId
-
             and userId ~= player.UserId
-
             and type(entry) == "table"
-
             and type(entry.weapons) == "table" then
 
-            local remotePlayer =
+            local updatedAt =
+                tonumber(entry.updatedAt) or 0
 
-                Players:GetPlayerByUserId(userId)
+            local previousUpdatedAt =
+                SharedUpdatedAt[userId] or 0
 
-            if remotePlayer then
-
+            if updatedAt >= previousUpdatedAt then
                 local clean =
-
                     sanitizeSharedWeapons(entry.weapons)
 
                 if next(clean) ~= nil then
-
-                    nextShared[userId] = clean
-
+                    SharedCosmetics[userId] = clean
+                else
+                    -- The other user cleared their shared cosmetics.
+                    SharedCosmetics[userId] = nil
                 end
 
+                SharedUpdatedAt[userId] = updatedAt
             end
-
         end
-
     end
 
-    SharedCosmetics = nextShared
+    local nextCursor = tonumber(response.cursor)
+
+    if nextCursor and nextCursor > syncCursor then
+        syncCursor = nextCursor
+    end
 
     return true
-
 end
 
 local syncPublishToken = 0
@@ -2788,42 +2552,30 @@ end
 
 task.defer(applyAll)
 
+-- Publish once when joining, then fetch the current shared state once.
+-- Later publishes are already triggered by saveConfig() when a local
+-- cosmetic selection changes.
 task.defer(function()
-
     publishSharedCosmetics()
-
     refreshSharedCosmetics()
-
 end)
 
-task.spawn(function()
-
-    local nextHeartbeat = 0
-
-    while task.wait(SYNC_POLL_SECONDS) do
-
-        refreshSharedCosmetics()
-
-        local now = os.clock()
-
-        if now >= nextHeartbeat then
-
-            publishSharedCosmetics()
-
-            nextHeartbeat =
-
-                now + SYNC_HEARTBEAT_SECONDS
-
-        end
-
+-- If somebody joins this same Roblox server, do one early incremental
+-- refresh instead of waiting for the next regular poll.
+Players.PlayerAdded:Connect(function(joinedPlayer)
+    if joinedPlayer ~= player then
+        task.delay(1, refreshSharedCosmetics)
     end
-
 end)
 
+Players.PlayerRemoving:Connect(function(leavingPlayer)
+    SharedCosmetics[leavingPlayer.UserId] = nil
+    SharedUpdatedAt[leavingPlayer.UserId] = nil
+end)
 
-task.wait(10)
-
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
-local DebugController = require(Players.LocalPlayer.PlayerScripts.Controllers:WaitForChild("DebugController"))
-DebugController:SetHandicapsEnabled(true)
+-- Receive only incremental changes. No periodic POST/heartbeat.
+task.spawn(function()
+    while task.wait(SYNC_POLL_SECONDS) do
+        refreshSharedCosmetics()
+    end
+end)
