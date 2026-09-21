@@ -2,7 +2,7 @@
 -- RIVALS KEY SYSTEM PROTECTION
 -- Must match Config.Secret in the Work.ink loader.
 -- ============================================================
-
+task.wait(10)
 local ProtectionConfig = {
     SecretKey = "RIVALS_ACCESS_5007119",
     HubName = "RIVALS",
