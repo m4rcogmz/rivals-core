@@ -4,6 +4,7 @@
 
 local __NightFall_PATH = "NightFall_PERSIST.lua"
 local __NightFall_SOURCE = [============[
+-- NF-BUILD: NF-20261005-KICIA-WEAPON-AUTORESPAWN-1
 -- NightFall boot guard: prevents two copies from initializing at the same time.
 local __NightFall_env = (getgenv and getgenv()) or _G
 local __NightFall_boot_token = {}
@@ -659,8 +660,17 @@ local Config = {
     RageCombatOrbitHeight = 8,
     RageCombatOrbitJitter = true,
     RagePBEyeUp           = 3,
-    RageOnEmpty          = "Swap",
-    RagePreferredSlot    = "Primary",
+    -- Kicia-style Rage weapon strategy.  Priority 1 replaces the old
+    -- "Prefer slot" behaviour; Priority 2/3 are fallbacks.
+    RageOnEmpty                = "SwapOrReload",
+    RagePreferredSlot          = "Primary", -- compatibility alias for older configs
+    RageWeaponPrimaryEnabled   = true,
+    RageWeaponSecondaryEnabled = true,
+    RageWeaponMeleeEnabled     = true,
+    RageWeaponPriority1        = "Primary",
+    RageWeaponPriority2        = "Secondary",
+    RageWeaponPriority3        = "Melee",
+    AutoRespawn                = false,
     TriggerScopeCheck    = false,
     SilentAimHitChance   = 85,
     SilentAimBodyMix     = 25,
@@ -8771,6 +8781,7 @@ local Rage = {}
         Rage._equipSlot = equipSlot
         Rage._nextUsableSlot = nextUsableSlot
         Rage._whichSlotNow = whichSlotNow
+        Rage._slotItemByIndex = slotItemByIndex
     end)()
     local function encodeRageShot(camData)
         if tick() - (State.RageFireStamp or 0) > 0.03 then return false end
@@ -9124,46 +9135,160 @@ local Rage = {}
         end)
     end
     local _SLOT_INDEX = { Primary = 1, Secondary = 2, Melee = 3 }
-    Rage._weaponRecovery = function(it)
-        if Rage._itemIsMelee and Rage._itemIsMelee(it) then return "loaded" end
-        local mode = Config.RageOnEmpty or "Reload"
-        local okA, ammo = pcall(function() return it and it:Get("Ammo") end)
-        local empty = not (okA and type(ammo) == "number" and ammo > 0)
-        if mode ~= "Swap" or not empty then
-            return Rage._ensureReload(it)
+    local _SLOT_NAME = { [1] = "Primary", [2] = "Secondary", [3] = "Melee" }
+
+    local function rageWeaponEnabled(slotName)
+        if slotName == "Primary" then return Config.RageWeaponPrimaryEnabled ~= false end
+        if slotName == "Secondary" then return Config.RageWeaponSecondaryEnabled ~= false end
+        if slotName == "Melee" then return Config.RageWeaponMeleeEnabled ~= false end
+        return false
+    end
+
+    -- Linoria does not have Kicia's ordered-list control, so NightFall exposes
+    -- three priority dropdowns.  Runtime de-duplicates them and fills missing
+    -- slots in Kicia's original Primary -> Secondary -> Melee order.
+    local function rageWeaponPriority()
+        local out, seen = {}, {}
+        local p1 = Config.RageWeaponPriority1 or Config.RagePreferredSlot or "Primary"
+        local p2 = Config.RageWeaponPriority2 or "Secondary"
+        local p3 = Config.RageWeaponPriority3 or "Melee"
+        for _, name in ipairs({ p1, p2, p3, "Primary", "Secondary", "Melee" }) do
+            if _SLOT_INDEX[name] and not seen[name] then
+                seen[name] = true
+                out[#out + 1] = name
+            end
         end
-        local lf = Rivals.Fighter and Rivals.Fighter.LocalFighter
+        Config.RagePreferredSlot = out[1] or "Primary"
+        return out
+    end
+
+    local function rageItemAt(lf, slot)
+        if Rage._slotItemByIndex then
+            local ok, item = pcall(Rage._slotItemByIndex, slot)
+            if ok and item ~= nil then return item end
+        end
         local items = lf and lf.Items
-        if type(items) ~= "table" then return Rage._ensureReload(it) end
-        if tick() - (State.RageSwitchLast or 0) < 0.5 then return "swap-wait" end
-        local pref = _SLOT_INDEX[Config.RagePreferredSlot or "Primary"] or 1
-        local other = pref == 1 and 2 or 1
-        for _, slot in ipairs({ pref, other }) do
-            local w = items[slot]
-            if w and w ~= it then
-                local okW, wammo = pcall(function() return w:Get("Ammo") end)
-                if okW and type(wammo) == "number" and wammo > 0 then
-                    local busy = false
-                    pcall(function()
-                        if w:IsEquipping() then busy = true end
-                    end)
-                    pcall(function()
-                        if (w._reload_cooldown or 0) > tick() then busy = true end
-                    end)
-                    if not busy then
-                        State.RageSwitchLast = tick()
-                        local okE = pcall(function() lf.EquipItem(lf, slot) end)
-                        if okE then
-                            State.AutoWeaponFails = 0
-                            return "swap"
+        if type(items) ~= "table" then return nil end
+        return items[slot] or items[tostring(slot)]
+    end
+
+    local function rageItemEquipped(lf, item)
+        if item == nil then return false end
+        local ok, equipped = pcall(function() return item:IsEquipped() end)
+        if ok then return equipped == true end
+        return lf and lf.EquippedItem == item
+    end
+
+    local function rageAmmo(item)
+        if item == nil or (Rage._itemIsMelee and Rage._itemIsMelee(item)) then
+            return math.huge
+        end
+        local ok, value = pcall(function() return item:Get("Ammo") end)
+        if ok and type(value) == "number" then return value end
+        -- Match NightFall's existing weaponReady behaviour: unreadable ammo is
+        -- treated as usable instead of forcing a false dry state.
+        return math.huge
+    end
+
+    local function rageReserve(item)
+        if item == nil or (Rage._itemIsMelee and Rage._itemIsMelee(item)) then
+            return math.huge
+        end
+        local ok, value = pcall(function() return item:Get("AmmoReserve") end)
+        if ok and type(value) == "number" then return value end
+        return math.huge
+    end
+
+    -- Port of Kicia's Ragebot weapon action selector.  Unlike NightFall's old
+    -- Prefer-slot option, this runs on every Rage tick, so the selected priority
+    -- actually decides which weapon is used even before the current gun is empty.
+    Rage._weaponAction = function()
+        local lf = Rivals.Fighter and Rivals.Fighter.LocalFighter
+        if not lf then return nil, "no-fighter" end
+
+        local onEmpty = Config.RageOnEmpty or "SwapOrReload"
+        local attackItem, attackSlot, attackRank = nil, nil, math.huge
+        local emptyItem, emptySlot, emptyRank = nil, nil, math.huge
+        local anyEnabledItem = false
+
+        for rank, slotName in ipairs(rageWeaponPriority()) do
+            if rageWeaponEnabled(slotName) then
+                local slot = _SLOT_INDEX[slotName]
+                local item = rageItemAt(lf, slot)
+                if item ~= nil then
+                    anyEnabledItem = true
+                    local melee = Rage._itemIsMelee and Rage._itemIsMelee(item)
+                    local ammo = rageAmmo(item)
+
+                    if not melee and ammo <= 0 then
+                        local reserve = rageReserve(item)
+                        if reserve > 0 then
+                            if onEmpty == "Reload" then
+                                if rank < attackRank then
+                                    attackItem, attackSlot, attackRank = item, slot, rank
+                                end
+                            elseif rank < emptyRank then
+                                emptyItem, emptySlot, emptyRank = item, slot, rank
+                            end
                         end
-                        State.AutoWeaponFails = (State.AutoWeaponFails or 0) + 1
-                        equipAtId2(lf, slot)
+                    elseif rank < attackRank then
+                        attackItem, attackSlot, attackRank = item, slot, rank
                     end
                 end
             end
         end
-        return Rage._ensureReload(it)
+
+        if not anyEnabledItem then
+            return nil, "no-enabled-weapon"
+        end
+
+        if attackItem ~= nil then
+            local isEmptyGun = not (Rage._itemIsMelee and Rage._itemIsMelee(attackItem))
+                and rageAmmo(attackItem) <= 0
+            if rageItemEquipped(lf, attackItem) then
+                if isEmptyGun then
+                    return { Type = "Reload", Item = attackItem, Slot = attackSlot }
+                end
+                return { Type = "Attack", Item = attackItem, Slot = attackSlot }
+            end
+            return { Type = "Swap", Item = attackItem, Slot = attackSlot }
+        end
+
+        -- Kicia's exact semantics: Swap never reloads an empty weapon as a
+        -- fallback. SwapOrReload does, after every loaded enabled weapon failed.
+        if onEmpty == "Swap" then
+            return nil, "dry"
+        end
+
+        if emptyItem ~= nil then
+            if rageItemEquipped(lf, emptyItem) then
+                return { Type = "Reload", Item = emptyItem, Slot = emptySlot }
+            end
+            return { Type = "Swap", Item = emptyItem, Slot = emptySlot }
+        end
+
+        return nil, "dry"
+    end
+
+    Rage._applyWeaponAction = function(action)
+        if action == nil then return "dry" end
+        if action.Type == "Attack" then return "loaded", action.Item end
+        if action.Type == "Reload" then
+            Rage._ensureReload(action.Item)
+            return "reload", action.Item
+        end
+        if action.Type == "Swap" then
+            local did = false
+            if Rage._equipSlot then did = Rage._equipSlot(action.Slot) == true end
+            return did and "swap" or "swap-wait", action.Item
+        end
+        return "dry", action.Item
+    end
+
+    -- Compatibility wrapper for the two older call sites and any external config.
+    Rage._weaponRecovery = function()
+        local action = Rage._weaponAction()
+        return Rage._applyWeaponAction(action)
     end
     Rage._ensureSlot = function(it, wantIdx)
         local lf = Rivals.Fighter and Rivals.Fighter.LocalFighter
@@ -9459,14 +9584,16 @@ local Rage = {}
             else
                 _orbDeflectSince = 0
             end
-            if not weaponReady(getEquippedItem()) then
-                local act = Rage._weaponRecovery(getEquippedItem())
-                if act == "dry" then
-                    return orbitVoid(hrp, "Dry")
-                end
-                if act == "swap" or act == "swap-wait" then
-                    return orbitVoid(hrp, "Swapping")
-                end
+            local weaponAction, weaponWhy = Rage._weaponAction()
+            if weaponAction == nil then
+                return orbitVoid(hrp, weaponWhy == "no-enabled-weapon" and "No enabled weapon" or "Dry")
+            end
+            local weaponState, selectedItem = Rage._applyWeaponAction(weaponAction)
+            if weaponState == "swap" or weaponState == "swap-wait" then
+                return orbitVoid(hrp, "Swapping")
+            elseif weaponState == "reload" then
+                return orbitVoid(hrp, "Reloading")
+            elseif not weaponReady(selectedItem) then
                 return orbitVoid(hrp, "Reloading")
             end
             local aimPos = hh.Position
@@ -11794,15 +11921,16 @@ end)()
         else
             _deflectSince = 0
         end
-        local it = getEquippedItem()
-        if not weaponReady(it) then
-            local act = Rage._weaponRecovery(it)
-            if act == "dry" then
-                return hide(hrp, "Dry")
-            end
-            if act == "swap" or act == "swap-wait" then
-                return hide(hrp, "Swapping")
-            end
+        local weaponAction, weaponWhy = Rage._weaponAction()
+        if weaponAction == nil then
+            return hide(hrp, weaponWhy == "no-enabled-weapon" and "No enabled weapon" or "Dry")
+        end
+        local weaponState, it = Rage._applyWeaponAction(weaponAction)
+        if weaponState == "swap" or weaponState == "swap-wait" then
+            return hide(hrp, "Swapping")
+        elseif weaponState == "reload" then
+            return hide(hrp, "Reloading")
+        elseif not weaponReady(it) then
             return hide(hrp, "Reloading")
         end
         local hh = tgt.Character:FindFirstChild("HitboxHead") or tgt.Character:FindFirstChild("Head")
@@ -17128,6 +17256,135 @@ pcall(Rage._startTransportWatcher)
 if Config.HUD then pcall(Visuals.enableHUD) end
 if Config.RageLab then pcall(Lab.enable) end
 pcall(HUDPlus.init)
+
+-- Kicia-style Auto Respawn -------------------------------------------------
+-- Kicia listens to ReplicatedController._ObjectChanged for the
+-- RespawnNowAnimation enum addressed to LocalPlayer, then sends five bounded
+-- RespawnNow requests 0.1s apart.  This keeps the same trigger and burst shape.
+local AutoRespawn = {
+    installed = false,
+    controller = nil,
+    original = nil,
+    wrapper = nil,
+    enumValue = nil,
+    remote = nil,
+    lastBurst = 0,
+}
+
+do
+    local function resolveRespawnPieces()
+        if AutoRespawn.remote == nil then
+            pcall(function()
+                AutoRespawn.remote = ReplicatedStorage.Remotes.Duels.RespawnNow
+            end)
+        end
+
+        if AutoRespawn.enumValue == nil and Rivals.Enums ~= nil then
+            pcall(function()
+                if type(Rivals.Enums.ToEnum) == "function" then
+                    AutoRespawn.enumValue = Rivals.Enums:ToEnum("RespawnNowAnimation")
+                end
+            end)
+            if AutoRespawn.enumValue == nil then
+                pcall(function()
+                    local map = rawget(Rivals.Enums, "_to_enum")
+                    if type(map) == "table" then
+                        AutoRespawn.enumValue = rawget(map, "RespawnNowAnimation")
+                    end
+                end)
+            end
+        end
+
+        if AutoRespawn.controller == nil then
+            pcall(function()
+                AutoRespawn.controller = loadGameModule(lp.PlayerScripts, { "Modules", "ReplicatedController" })
+            end)
+        end
+
+        return AutoRespawn.remote ~= nil
+            and AutoRespawn.enumValue ~= nil
+            and type(AutoRespawn.controller) == "table"
+    end
+
+    local function respawnBurst()
+        if Config.AutoRespawn ~= true then return end
+        if tick() - AutoRespawn.lastBurst < 0.35 then return end
+        AutoRespawn.lastBurst = tick()
+
+        task.spawn(function()
+            if not resolveRespawnPieces() then return end
+            local remote = AutoRespawn.remote
+            if remote == nil then return end
+            for i = 1, 5 do
+                if Config.AutoRespawn ~= true then break end
+                pcall(function() remote:FireServer() end)
+                if i < 5 then task.wait(0.1) end
+            end
+        end)
+    end
+
+    function AutoRespawn.install()
+        if AutoRespawn.installed then return true end
+        if not resolveRespawnPieces() then return false end
+
+        local controller = AutoRespawn.controller
+        local original = rawget(controller, "_ObjectChanged")
+        if type(original) ~= "function" then return false end
+
+        local wrapper
+        wrapper = function(self, objectId, enumValue, ...)
+            if Config.AutoRespawn == true and enumValue == AutoRespawn.enumValue then
+                local args = table.pack(...)
+                if args[1] == lp then
+                    respawnBurst()
+                end
+            end
+            return coroutine.wrap(original)(self, objectId, enumValue, ...)
+        end
+
+        local ok = pcall(function() rawset(controller, "_ObjectChanged", wrapper) end)
+        if not ok then return false end
+
+        AutoRespawn.original = original
+        AutoRespawn.wrapper = wrapper
+        AutoRespawn.installed = true
+        return true
+    end
+
+    function AutoRespawn.setEnabled(enabled)
+        Config.AutoRespawn = enabled == true
+        if Config.AutoRespawn then
+            if not AutoRespawn.install() then
+                task.spawn(function()
+                    for _ = 1, 40 do
+                        if Config.AutoRespawn ~= true or AutoRespawn.installed then break end
+                        task.wait(0.25)
+                        AutoRespawn.install()
+                    end
+                end)
+            end
+        end
+    end
+
+    function AutoRespawn.unload()
+        if AutoRespawn.installed and AutoRespawn.controller and AutoRespawn.original then
+            pcall(function()
+                if rawget(AutoRespawn.controller, "_ObjectChanged") == AutoRespawn.wrapper then
+                    rawset(AutoRespawn.controller, "_ObjectChanged", AutoRespawn.original)
+                end
+            end)
+        end
+        AutoRespawn.installed = false
+        AutoRespawn.controller = nil
+        AutoRespawn.original = nil
+        AutoRespawn.wrapper = nil
+    end
+
+    task.defer(function()
+        if Config.AutoRespawn == true then AutoRespawn.setEnabled(true) end
+    end)
+end
+
 do
     -- Automation: Auto load / Silent load / Auto queue / Auto loadout
     --
@@ -18412,14 +18669,27 @@ do (function()
     extDep:SetupDependencies({ { Options.RageMode, 'External' } })
     -- ────────────────────────────────────────────────────────────────────────
 
-    local WEP = Tabs.Rage:AddRightGroupbox('Weapon')
+    local WEP = Tabs.Rage:AddRightGroupbox('Weapon Strategy')
+    WEP:AddToggle('RageWeaponPrimaryEnabled', { Text='Primary enabled', Default=(Config.RageWeaponPrimaryEnabled ~= false),
+        Callback=function(v) Config.RageWeaponPrimaryEnabled = v end })
+    WEP:AddToggle('RageWeaponSecondaryEnabled', { Text='Secondary enabled', Default=(Config.RageWeaponSecondaryEnabled ~= false),
+        Callback=function(v) Config.RageWeaponSecondaryEnabled = v end })
+    WEP:AddToggle('RageWeaponMeleeEnabled', { Text='Melee enabled', Default=(Config.RageWeaponMeleeEnabled ~= false),
+        Callback=function(v) Config.RageWeaponMeleeEnabled = v end })
+    WEP:AddDivider('Weapon priority')
+    WEP:AddDropdown('RageWeaponPriority1', { Values={'Primary','Secondary','Melee'},
+        Default=(Config.RageWeaponPriority1 or Config.RagePreferredSlot or 'Primary'), Text='Priority 1',
+        Callback=function(v) Config.RageWeaponPriority1 = v; Config.RagePreferredSlot = v end })
+    WEP:AddDropdown('RageWeaponPriority2', { Values={'Primary','Secondary','Melee'},
+        Default=(Config.RageWeaponPriority2 or 'Secondary'), Text='Priority 2',
+        Callback=function(v) Config.RageWeaponPriority2 = v end })
+    WEP:AddDropdown('RageWeaponPriority3', { Values={'Primary','Secondary','Melee'},
+        Default=(Config.RageWeaponPriority3 or 'Melee'), Text='Priority 3',
+        Callback=function(v) Config.RageWeaponPriority3 = v end })
     WEP:AddDivider('On empty magazine')
-    WEP:AddDropdown('RageOnEmpty', { Values={'Swap','Reload'},
-        Default=(Config.RageOnEmpty or 'Swap'), Text='Action',
+    WEP:AddDropdown('RageOnEmpty', { Values={'Reload','Swap','SwapOrReload'},
+        Default=(Config.RageOnEmpty or 'SwapOrReload'), Text='Action',
         Callback=function(v) Config.RageOnEmpty = v end })
-    WEP:AddDropdown('RagePreferredSlot', { Values={'Primary','Secondary','Melee'},
-        Default=(Config.RagePreferredSlot or 'Primary'), Text='Prefer slot',
-        Callback=function(v) Config.RagePreferredSlot = v end })
     local B = Tabs.Rage:AddRightGroupbox('Melee')
     B:AddToggle('AvoidDeflect', { Text='Avoid katana deflect', Default=Config.AvoidDeflect,
         Callback=function(v) Config.AvoidDeflect = v end })
@@ -18437,6 +18707,17 @@ do (function()
         Callback=function(v) Config.RageShieldBackstab = v end })
     B:AddToggle('RageKnifeBackstab', { Text='Force knife backstabs', Default=Config.RageKnifeBackstab,
         Callback=function(v) Config.RageKnifeBackstab = v end })
+
+    local RU = Tabs.Rage:AddRightGroupbox('Rage Utility')
+    RU:AddToggle('AutoRespawn', { Text='Auto respawn', Default=(Config.AutoRespawn == true),
+        Callback=function(v)
+            if AutoRespawn and AutoRespawn.setEnabled then
+                AutoRespawn.setEnabled(v)
+            else
+                Config.AutoRespawn = v
+            end
+        end })
+
     local DR = Tabs.Rage:AddRightGroupbox('Auto Collect Drops')
     DR:AddToggle('AutoCollectDrops', { Text='Auto collect drops', Default=(Config.AutoCollectDrops or false),
         Callback=function(v) Config.AutoCollectDrops = v end })
@@ -19394,6 +19675,7 @@ Library.Unload = function(self, ...)
     end)
     pcall(ViewAngle.restore)
     pcall(ConstPatch.revertAll)
+    pcall(function() if AutoRespawn and AutoRespawn.unload then AutoRespawn.unload() end end)
     GameVisuals.uiAlive = false
     pcall(GameVisuals.disable)
     return _origUnload(self, ...)
